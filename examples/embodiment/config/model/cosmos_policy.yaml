@@ -1,0 +1,38 @@
+model_type: "cosmos_policy"
+
+# Model path - HuggingFace repo id or local checkpoint dir.
+# e.g. "nvidia/Cosmos-Policy-LIBERO-Predict2-2B"
+model_path: "/path/to/model/cosmos_policy"
+
+precision: "bf16"
+
+# Action and chunk settings (top-level so RLinf workers can read them;
+# forwarded into the cosmos: namespace via interpolation below)
+num_action_chunks: 16
+action_dim: 7
+
+# LoRA settings
+is_lora: False
+lora_rank: 32
+
+# Training settings
+use_proprio: True
+num_steps: 5  # Number of denoising steps for action prediction
+add_value_head: False  # Cosmos has its own value prediction; toggle when using a separate critic
+
+# RLinf wrapper-specific settings (consumed by
+# rlinf/models/embodiment/cosmos_policy/__init__.py:get_model)
+dataset_stats_path: null  # Path to per-dataset normalization stats (json)
+t5_text_embeddings_path: null  # Optional path to precomputed T5 embeddings cache (pickle)
+
+# cosmos-policy specific parameters (forwarded as-is to cosmos_utils.get_model)
+cosmos:
+  experiment_name: "cosmos_predict2_2b_480p_libero__inference_only"
+  chunk_size: ${actor.model.num_action_chunks}
+  num_open_loop_steps: ${actor.model.num_action_chunks}
+  num_denoising_steps_action: ${actor.model.num_steps}
+  num_denoising_steps_future_state: 1
+  num_denoising_steps_value: 1
+  generate_future_state_and_value_in_parallel: True
+  randomize_seed: False
+  seed: 1

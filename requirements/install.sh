@@ -7,7 +7,7 @@ TARGET=""
 MODEL=""
 ENV_NAME=""
 VENV_DIR=".venv"
-PYTHON_VERSION="3.11.14"
+PYTHON_VERSION="3.10.18"
 TEST_BUILD=${TEST_BUILD:-0}
 # Absolute path to this script (resolves symlinks)
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
@@ -17,7 +17,7 @@ GITHUB_PREFIX=""
 NO_ROOT=0
 NO_INSTALL_RLINF_CMD="--no-install-project"
 SUPPORTED_TARGETS=("embodied" "agentic" "docs")
-SUPPORTED_MODELS=("openvla" "openvla-oft" "openpi" "gr00t" "dexbotic" "starvla" "lingbotvla" "dreamzero")
+SUPPORTED_MODELS=("openvla" "openvla-oft" "openpi" "gr00t" "dexbotic" "starvla" "lingbotvla" "dreamzero" "cosmos-policy")
 SUPPORTED_ENVS=("behavior" "maniskill_libero" "metaworld" "calvin" "isaaclab" "robocasa" "franka" "frankasim" "robotwin" "habitat" "opensora" "wan" "xsquare_turtle2" "liberopro" "liberoplus" "roboverse" "embodichain" "d4rl" "dosw1" "gim_arm")
 
 #=======================Utility Functions=======================
@@ -662,6 +662,30 @@ install_dreamzero_model() {
     esac
 }
 
+install_cosmos_policy_model() {
+    create_and_sync_venv
+    install_common_embodied_deps
+
+    local cosmos_policy_path
+    cosmos_policy_path=$(clone_or_reuse_repo COSMOS_POLICY_PATH "third_party/cosmos-policy" ${GITHUB_PREFIX}https://github.com/Donghyun1228/cosmos-policy-RL.git)
+    # Use the cu128 extra so cosmos pulls torch 2.7.0+cu128 wheels and the
+    # matching NVIDIA libraries (required for Blackwell sm_120 GPUs).
+    uv pip install -e "${cosmos_policy_path}[cu128]"
+
+    case "$ENV_NAME" in
+        maniskill_libero)
+            install_maniskill_libero_env
+            ;;
+        "")
+            ;;
+        *)
+            echo "Environment '$ENV_NAME' is not supported for Cosmos Policy model." >&2
+            exit 1
+            ;;
+    esac
+    uv pip uninstall pynvml || true
+}
+
 install_env_only() {
     create_and_sync_venv
     SKIP_ROS=${SKIP_ROS:-0}
@@ -1137,7 +1161,7 @@ main() {
                     echo "Unknown environment: $ENV_NAME. Supported environments: ${SUPPORTED_ENVS[*]}" >&2
                     exit 1
                 fi
-            elif [ "$MODEL" != "dreamzero" ]; then
+            elif [ "$MODEL" != "dreamzero" ] && [ "$MODEL" != "cosmos-policy" ]; then
                 echo "--env must be specified when target=embodied." >&2
                 exit 1
             fi
@@ -1166,6 +1190,9 @@ main() {
                     ;;
                 dreamzero)
                     install_dreamzero_model
+                    ;;
+                cosmos-policy)
+                    install_cosmos_policy_model
                     ;;
                 "")
                     install_env_only

@@ -168,10 +168,9 @@ conflicts = [
     ],
 ]
 override-dependencies = [
-    "torch==2.6.0",
-    "torchvision==0.21.0",
-    "torchaudio==2.6.0",
-    "torchcodec==0.2",
+    # torch/torchvision/torchaudio/torchcodec pins removed to allow newer
+    # PyTorch (e.g. 2.7+ for Blackwell sm_120 GPUs and cosmos-policy cu128).
+    # The accepted range is still constrained by [project].dependencies above.
     "xgrammar==0.1.19",
     "uvloop==0.21.0",
     "tensorflow-addons==0.23.0",
