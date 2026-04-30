@@ -1177,6 +1177,24 @@ class EnvWorker(Worker):
                     )
 
             self.finish_rollout(mode="eval")
+
+            running = {}
+            total_traj = 0
+            for k, v in eval_metrics.items():
+                if not v:
+                    continue
+                cat = torch.cat(v, dim=0)
+                running[k] = float(cat.float().mean().item())
+                if k == next(iter(eval_metrics)):
+                    total_traj = cat.shape[0]
+            if running:
+                summary = ", ".join(f"{k}={v:.3f}" for k, v in running.items())
+                self.log_info(
+                    f"[eval epoch {eval_rollout_epoch + 1}/"
+                    f"{self.cfg.algorithm.eval_rollout_epoch}] "
+                    f"trajectories={total_traj} | {summary}"
+                )
+
         for stage_id in range(self.stage_num):
             if self.cfg.env.eval.get("enable_offload", False) and hasattr(
                 self.eval_env_list[stage_id], "offload"

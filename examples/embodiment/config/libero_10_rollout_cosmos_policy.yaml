@@ -1,0 +1,141 @@
+defaults:
+  - env/libero_10@env.train
+  - env/libero_10@env.eval
+  - model/cosmos_policy@actor.model
+  - model/cosmos_policy@rollout.model
+  - weight_syncer/patch_syncer@weight_syncer
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: all
+
+runner:
+  task_type: embodied
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "libero_10_rollout_cosmos_policy"
+    logger_backends: ["tensorboard"]
+
+  max_epochs: 1
+  max_steps: -1
+
+  only_eval: True
+  val_check_interval: -1
+  save_interval: 999999
+
+  resume_dir: null
+  ckpt_path: null
+
+algorithm:
+  normalize_advantages: False
+  group_size: 1
+  reward_coef: 1.0
+  rollout_epoch: 1
+  eval_rollout_epoch: 125  # 500 trials / 4 envs per epoch = 125 epochs
+
+  update_epoch: 0
+  adv_type: gae
+  loss_type: ppo
+  kl_beta: 0.0
+  entropy_bonus: 0
+  clip_ratio_high: 0.2
+  clip_ratio_low: 0.2
+
+  gamma: 0.99
+  gae_lambda: 0.95
+
+  sampling_params:
+    do_sample: True
+    temperature_train: 1.0
+    temperature_eval: 0.6
+    top_k: 50
+    top_p: 1.0
+    repetition_penalty: 1.0
+    add_BOS: False
+
+  length_params:
+    max_new_token: null
+    max_length: 1024
+    min_length: 1
+
+env:
+  group_name: "EnvGroup"
+
+  train:
+    total_num_envs: 4
+    max_episode_steps: 480
+    max_steps_per_rollout_epoch: 480
+    reward_coef: ${algorithm.reward_coef}
+  eval:
+    total_num_envs: 4
+    auto_reset: False
+    ignore_terminations: False
+    max_episode_steps: 480
+    max_steps_per_rollout_epoch: 480
+    group_size: 1
+    use_fixed_reset_state_ids: True
+    use_ordered_reset_state_ids: True
+    is_eval: True
+    video_cfg:
+      save_video: False
+
+rollout:
+  group_name: "RolloutGroup"
+  generation_backend: "huggingface"
+  recompute_logprobs: False
+  collect_prev_infos: False
+  enable_offload: False
+  pipeline_stage_num: 1
+
+  model:
+    model_path: "nvidia/Cosmos-Policy-LIBERO-Predict2-2B"
+    precision: ${actor.model.precision}
+    dataset_stats_path: "/home/donghyun/.cache/huggingface/hub/models--nvidia--Cosmos-Policy-LIBERO-Predict2-2B/snapshots/cb689ec0e3347c13667d70a78a3447388f5c3bb8/libero_dataset_statistics.json"
+    t5_text_embeddings_path: "/home/donghyun/.cache/huggingface/hub/models--nvidia--Cosmos-Policy-LIBERO-Predict2-2B/snapshots/cb689ec0e3347c13667d70a78a3447388f5c3bb8/libero_t5_embeddings.pkl"
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 4
+  global_batch_size: 4
+  seed: 42
+  enable_offload: False
+
+  model:
+    model_path: "nvidia/Cosmos-Policy-LIBERO-Predict2-2B"
+    add_value_head: False
+    dataset_stats_path: "/home/donghyun/.cache/huggingface/hub/models--nvidia--Cosmos-Policy-LIBERO-Predict2-2B/snapshots/cb689ec0e3347c13667d70a78a3447388f5c3bb8/libero_dataset_statistics.json"
+    t5_text_embeddings_path: "/home/donghyun/.cache/huggingface/hub/models--nvidia--Cosmos-Policy-LIBERO-Predict2-2B/snapshots/cb689ec0e3347c13667d70a78a3447388f5c3bb8/libero_t5_embeddings.pkl"
+
+  optim:
+    lr: 0.0
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    clip_grad: 2.0
+    weight_decay: 0.0
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    gradient_checkpointing: False
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False

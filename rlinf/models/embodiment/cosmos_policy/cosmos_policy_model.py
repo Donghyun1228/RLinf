@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+import numpy as np
 import torch
 import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
@@ -51,6 +52,34 @@ class CosmosPolicyForRLActionPrediction(nn.Module, BasePolicy):
         self.runtime_cfg = runtime_cfg
         self.logger = get_logger()
         self.global_step = 0
+
+        # Cosmos's get_action expects a PolicyEvalConfig (suite, use_proprio,
+        # chunk_size, etc.) — distinct from the model-loading config returned
+        # by get_model. The same object is reused for every cosmos forward
+        # (rollout and, later, residual-module training).
+        self.eval_cfg = self._build_eval_cfg(runtime_cfg)
+
+    @staticmethod
+    def _build_eval_cfg(runtime_cfg: Optional[DictConfig]):
+        """Construct cosmos PolicyEvalConfig from the YAML ``cosmos:`` block.
+
+        Pulls only keys that match PolicyEvalConfig dataclass fields; unknown
+        keys (used elsewhere by ``_build_cosmos_cfg``) are dropped silently.
+        """
+        from cosmos_policy.experiments.robot.libero.run_libero_eval import (
+            PolicyEvalConfig,
+        )
+
+        cosmos_block = (
+            runtime_cfg.get("cosmos", None) if runtime_cfg is not None else None
+        )
+        extras: dict[str, Any] = {}
+        if cosmos_block is not None:
+            extras = OmegaConf.to_container(cosmos_block, resolve=True) or {}
+
+        valid_keys = set(PolicyEvalConfig.__dataclass_fields__.keys())
+        kwargs = {k: v for k, v in extras.items() if k in valid_keys}
+        return PolicyEvalConfig(**kwargs)
 
     @classmethod
     def from_config(
@@ -157,27 +186,63 @@ class CosmosPolicyForRLActionPrediction(nn.Module, BasePolicy):
             "residual module's forward directly from the actor worker."
         )
 
+    @staticmethod
+    def _to_numpy_hwc(img: Any) -> np.ndarray:
+        """Convert a (H,W,C) tensor or numpy array to uint8 numpy (H,W,C),
+        and undo RLinf LIBERO's 180° rotation so the result matches cosmos's
+        ``np.flipud``-only training preprocessing.
+
+        RLinf applies ``img[::-1, ::-1]`` (rotate 180°); cosmos LIBERO was
+        trained on ``np.flipud(img)`` (vertical flip only). The two differ by
+        one horizontal flip, which we apply here.
+        """
+        if torch.is_tensor(img):
+            img = img.cpu().numpy()
+        if img.dtype != np.uint8:
+            img = (img * 255).clip(0, 255).astype(np.uint8)
+        return np.ascontiguousarray(img[:, ::-1])
+
+    @staticmethod
+    def _libero_state_to_cosmos_proprio(state: np.ndarray) -> np.ndarray:
+        """RLinf LIBERO state (8d: eef_pos[3], axisangle[3], gripper[2]) →
+        cosmos LIBERO proprio (9d: gripper[2], eef_pos[3], eef_quat[4])."""
+        eef_pos = state[:3]
+        axisangle = state[3:6]
+        gripper = state[6:8]
+
+        angle = float(np.linalg.norm(axisangle))
+        if angle < 1e-8:
+            quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        else:
+            axis = axisangle / angle
+            half = angle * 0.5
+            quat = np.concatenate(
+                [axis * np.sin(half), np.array([np.cos(half)])]
+            ).astype(np.float32)
+
+        return np.concatenate([gripper, eef_pos, quat]).astype(np.float32)
+
     @torch.no_grad()
     def predict_action_batch(
         self,
-        observation: dict,
-        task_description: Any,
+        env_obs: dict,
+        mode: str = "train",
         seed: int = 1,
         randomize_seed: bool = False,
         num_denoising_steps_action: int = 5,
-        generate_future_state_and_value_in_parallel: bool = True,
-        worker_id: int = 0,
-        batch_size: int = 1,
+        generate_future_state_and_value_in_parallel: bool = False,
         **kwargs,
-    ) -> dict:
-        """Run cosmos inference on a batch and return action / value /
-        future-image predictions.
+    ) -> tuple[torch.Tensor, dict]:
+        """RLinf rollout worker interface.
 
-        Args:
-            observation: Multi-modal observation dict expected by cosmos
-                (images, proprio, etc.).
-            task_description: Either a language string or a precomputed T5
-                embedding (numpy array).
+        Converts the standard RLinf ``env_obs`` dict to cosmos format, runs
+        cosmos denoising per environment, and returns ``(actions, result)``
+        matching the RLinf rollout contract.
+
+        ``result`` contains:
+            - ``prev_logprobs``: zeros placeholder (cosmos has no logprob).
+            - ``prev_values``: ``None`` (no value head on base wrapper).
+            - ``forward_inputs``: empty dict (no actor training on base wrapper).
         """
         from cosmos_policy.experiments.robot.cosmos_utils import (
             get_action as cosmos_get_action,
@@ -189,17 +254,53 @@ class CosmosPolicyForRLActionPrediction(nn.Module, BasePolicy):
                 "Set cfg.dataset_stats_path or assign to model.dataset_stats."
             )
 
-        outputs = cosmos_get_action(
-            self.cosmos_config,
-            self.cosmos_model,
-            self.dataset_stats,
-            observation,
-            task_description,
-            seed=seed,
-            randomize_seed=randomize_seed,
-            num_denoising_steps_action=num_denoising_steps_action,
-            generate_future_state_and_value_in_parallel=generate_future_state_and_value_in_parallel,
-            worker_id=worker_id,
-            batch_size=batch_size,
-        )
-        return outputs
+        # env_obs tensors: (B, ...) or (B, H, W, C)
+        main_images = env_obs["main_images"]
+        wrist_images = env_obs.get("wrist_images", None)
+        states = env_obs.get("states", None)
+        task_descriptions = env_obs["task_descriptions"]
+
+        num_envs = main_images.shape[0]
+        all_actions = []
+
+        for i in range(num_envs):
+            obs = {
+                "primary_image": self._to_numpy_hwc(main_images[i]),
+            }
+            if wrist_images is not None:
+                obs["wrist_image"] = self._to_numpy_hwc(wrist_images[i])
+            if states is not None:
+                s = states[i]
+                s = s.cpu().numpy() if torch.is_tensor(s) else s
+                # RLinf LIBERO state is 8-dim with axis-angle; cosmos LIBERO
+                # proprio is 9-dim with quaternion in a different field order.
+                obs["proprio"] = self._libero_state_to_cosmos_proprio(s)
+
+            task_desc = task_descriptions[i] if isinstance(task_descriptions, (list, tuple)) else task_descriptions
+
+            outputs = cosmos_get_action(
+                self.eval_cfg,
+                self.cosmos_model,
+                self.dataset_stats,
+                obs,
+                task_desc,
+                seed=seed,
+                randomize_seed=randomize_seed,
+                num_denoising_steps_action=num_denoising_steps_action,
+                generate_future_state_and_value_in_parallel=generate_future_state_and_value_in_parallel,
+                batch_size=1,
+            )
+            # cosmos returns actions as a list of (action_dim,) arrays, one per chunk step
+            action_chunk = np.stack(outputs["actions"], axis=0)  # (chunk_size, action_dim)
+            all_actions.append(action_chunk)
+
+        # (B, chunk_size, action_dim)
+        actions = torch.from_numpy(np.stack(all_actions, axis=0)).float()
+
+        result = {
+            # zeros placeholder so rollout worker can build the versions tensor
+            "prev_logprobs": torch.zeros(num_envs, actions.shape[1], dtype=torch.float32),
+            "prev_values": None,
+            "forward_inputs": {},
+        }
+        return actions, result
