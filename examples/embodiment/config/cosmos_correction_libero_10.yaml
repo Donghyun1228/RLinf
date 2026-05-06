@@ -15,8 +15,13 @@ hydra:
 
 cluster:
   num_nodes: 1
+  # 2 env worker processes on GPU 0 (`0:0-1` = resource rank 0,
+  # process ranks 0-1 sharing it). Cosmos VLA lives in a separate
+  # named Ray actor so both env workers RPC into the same model
+  # without each loading their own 8GB copy.
   component_placement:
-    env,actor,rollout: 0
+    env: 0:0-1
+    actor,rollout: 0
 
 
 runner:
