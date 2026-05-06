@@ -31,7 +31,7 @@ env_resolution: 256
 
 # EnvWorker / RLinf-side fields (single-env for now; multi-env requires
 # sharing the cosmos model across envs in the same process and is deferred).
-total_num_envs: 2   # one per env worker (2 env workers on GPU 0)
+total_num_envs: 4   # one per env worker (4 env workers on GPU 0)
 group_size: 1
 # Auto-reset on chunk termination so EnvWorker can keep rolling
 # without an explicit reset call. The terminal obs is preserved in
