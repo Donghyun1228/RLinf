@@ -38,5 +38,5 @@ ignore_terminations: False
 video_cfg:
   save_video: True
   info_on_video: True
-  extra_info_on_video: ["task_id", "success", "dense_reward"]
+  extra_info_on_video: ["task_id", "trial_id", "success", "dense_reward"]
   video_base_dir: ${runner.logger.log_path}/video/train

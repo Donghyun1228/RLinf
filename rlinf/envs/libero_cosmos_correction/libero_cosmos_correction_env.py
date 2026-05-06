@@ -174,6 +174,10 @@ class LiberoCosmosCorrectionEnvCfg:
     # episode, rebuilding the underlying LIBERO sim. Lets one env worker
     # cycle through the full suite without a vec wrapper.
     task_ids: list[int] = field(default_factory=list)
+    # LIBERO stores ~50 init states per task; ``reset()`` randomly picks
+    # one each episode unless ``trial_id >= 0`` is set (single-trial,
+    # used by smoke tests).
+    trial_id: int = -1
     max_episode_steps: int = 520
 
     # Cosmos checkpoint (HF repo id; assets resolved from local HF cache)
@@ -303,6 +307,8 @@ class LiberoCosmosCorrectionEnv(gym.Env):
             self._task_pool = [cfg.task_id]
         self._task_rng = np.random.default_rng(seed_offset)
         self._current_task_id: Optional[int] = None
+        self._current_trial_id: Optional[int] = None
+        self._init_states = []
         self._libero_env = None
         self._task_description = ""
         self._build_libero_for_task(self._task_pool[0])
@@ -317,7 +323,9 @@ class LiberoCosmosCorrectionEnv(gym.Env):
         """(Re)build the underlying LIBERO sim for ``task_id``.
 
         We close the previous sim if any so MuJoCo doesn't leak GL
-        contexts when cycling tasks across episodes.
+        contexts when cycling tasks across episodes. The list of init
+        states for the new task is cached for ``reset()`` to sample
+        from.
         """
         if self._libero_env is not None:
             try:
@@ -329,6 +337,7 @@ class LiberoCosmosCorrectionEnv(gym.Env):
             task, "cosmos", resolution=self.cfg.env_resolution
         )
         self._current_task_id = task_id
+        self._init_states = self._bench.get_task_init_states(task_id)
 
     # ------------------------------------------------------------------
     # gym.Env interface
@@ -346,7 +355,18 @@ class LiberoCosmosCorrectionEnv(gym.Env):
             if new_task_id != self._current_task_id:
                 self._build_libero_for_task(new_task_id)
 
-        obs = self._libero_env.reset()
+        # LIBERO ships ~50 init states per task; randomize unless the
+        # cfg pins a specific trial id. Same RNG as task selection so
+        # different env workers (different seed_offset) explore
+        # different (task, trial) pairs.
+        if self.cfg.trial_id >= 0:
+            trial_id = self.cfg.trial_id
+        else:
+            trial_id = int(self._task_rng.integers(0, len(self._init_states)))
+        self._current_trial_id = trial_id
+
+        self._libero_env.reset()
+        obs = self._libero_env.set_init_state(self._init_states[trial_id])
         for _ in range(self.cfg.num_steps_wait_after_reset):
             obs, _, _, _ = self._libero_env.step(
                 get_libero_dummy_action(self.cosmos_cfg.model_family)
@@ -414,6 +434,7 @@ class LiberoCosmosCorrectionEnv(gym.Env):
             "truncated": truncated,
             "step": self._step_count,
             "task_id": self._current_task_id,
+            "trial_id": self._current_trial_id,
             "task_description": self._task_description,
         }
 
