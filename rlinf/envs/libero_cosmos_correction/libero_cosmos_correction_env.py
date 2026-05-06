@@ -340,25 +340,23 @@ class LiberoCosmosCorrectionEnv(gym.Env):
         self._init_states = self._bench.get_task_init_states(task_id)
 
     # ------------------------------------------------------------------
-    # gym.Env interface
+    # RLinf vectorized env API (single-env: leading num_envs dim is 1)
     # ------------------------------------------------------------------
-    def reset(self) -> dict[str, np.ndarray]:
-        """Reset libero env + run the first cosmos cycle.
+    def reset(self) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+        """Reset libero + run the first cosmos cycle.
 
-        Returns the initial state ``{"z_obs", "z_goal"}`` as numpy
-        float32 arrays, matching the configured observation space. If
-        ``cfg.task_ids`` has more than one entry, a new task is sampled
-        and the underlying LIBERO sim is rebuilt before the reset.
+        Returns ``(obs, info)`` matching the gymnasium-style 2-tuple.
+        ``obs`` keys (``z_obs`` / ``z_goal``) carry a leading num_envs=1
+        dim so the EnvWorker / replay-buffer pipeline sees the same
+        layout as standard vec envs.
         """
         if len(self._task_pool) > 1:
             new_task_id = int(self._task_rng.choice(self._task_pool))
             if new_task_id != self._current_task_id:
                 self._build_libero_for_task(new_task_id)
 
-        # LIBERO ships ~50 init states per task; randomize unless the
-        # cfg pins a specific trial id. Same RNG as task selection so
-        # different env workers (different seed_offset) explore
-        # different (task, trial) pairs.
+        # LIBERO ships ~50 init states per task; randomize unless cfg
+        # pins a specific trial id (smoke tests).
         if self.cfg.trial_id >= 0:
             trial_id = self.cfg.trial_id
         else:
@@ -374,32 +372,40 @@ class LiberoCosmosCorrectionEnv(gym.Env):
         self._last_obs = obs
         self._step_count = 0
 
-        # First cosmos cycle: predict + execute chunk -> post-chunk obs.
         self._roll_cosmos_cycle()
-        return self._build_state()
+        info = {
+            "task_id": self._current_task_id,
+            "trial_id": self._current_trial_id,
+            "task_description": self._task_description,
+        }
+        return self._batched_state(), info
 
     def step(
-        self, action: np.ndarray | torch.Tensor
-    ) -> tuple[dict[str, np.ndarray], float, bool, dict[str, Any]]:
+        self,
+        actions: np.ndarray | torch.Tensor,
+        auto_reset: bool = True,
+    ) -> tuple[
+        dict[str, torch.Tensor],
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        dict[str, Any],
+    ]:
         """One RL step = correction + reward + next cosmos cycle.
 
-        Returns ``(state, reward, done, info)``. ``info`` exposes the
-        reward components so the runner can log them separately.
+        ``actions`` is a ``(1, ACTION_DIM)`` tensor / array (num_envs=1).
+        Returns ``(obs, reward, terminations, truncations, info)`` with
+        all tensor fields shaped ``(1,)`` (or ``(1, ...)`` for obs values)
+        to match the RLinf vec env contract that ``EnvWorker.chunk_step``
+        consumes.
         """
-        if isinstance(action, torch.Tensor):
-            action = action.detach().cpu().numpy()
-        if action.shape != (ACTION_DIM,):
-            raise ValueError(
-                f"action shape must be ({ACTION_DIM},); got {tuple(action.shape)}"
-            )
+        action = self._unbatch_action(actions)
         if self._goal is None or self._cosmos_action_chunk is None:
             raise RuntimeError("Call reset() before step().")
 
-        # 1. Post-chunk standalone correction: the 6-DOF EE delta is
-        #    the correction itself (in cosmos's normalized action
-        #    space), unnormalized via the cached dataset stats. The
-        #    gripper passes through from cosmos's last action so the
-        #    grasp state is preserved when correction = 0.
+        # 1. Compose the 7-DOF env action: correction in normalized
+        #    space, unnormalized via dataset stats; cosmos gripper
+        #    passes through.
         last_cosmos = self._cosmos_action_chunk[0, -1].cpu().numpy()  # (7,)
         correction_raw = action.astype(np.float32) * self._action_scale  # (6,)
         composed = np.concatenate(
@@ -407,7 +413,7 @@ class LiberoCosmosCorrectionEnv(gym.Env):
             axis=-1,
         )
 
-        # 2. Execute correction step.
+        # 2. Execute one libero step.
         obs, _reward, done, _info = self._libero_env.step(composed.tolist())
         self._last_obs = obs
         self._step_count += 1
@@ -415,8 +421,8 @@ class LiberoCosmosCorrectionEnv(gym.Env):
         truncated = (not success) and (self._step_count >= self.cfg.max_episode_steps)
         terminal = success or truncated
 
-        # 3. Dense reward = cos_sim(z_obs_after, z_goal) on the
-        #    *current* cycle's goal (cached at the start of this step).
+        # 3. Reward: dense cos-sim on post-correction obs vs cached goal,
+        #    plus sparse success bonus.
         z_obs_after = self._encode_obs(obs)
         z_goal = self._goal.goal_z_rl
         dense = float(
@@ -427,7 +433,7 @@ class LiberoCosmosCorrectionEnv(gym.Env):
         sparse = self.cfg.success_bonus if success else 0.0
         reward = self.cfg.dense_coef * dense + sparse
 
-        info = {
+        info: dict[str, Any] = {
             "dense_reward": dense,
             "sparse_reward": sparse,
             "success": success,
@@ -438,18 +444,101 @@ class LiberoCosmosCorrectionEnv(gym.Env):
             "task_description": self._task_description,
         }
 
-        # 4. If terminal, the next state is unused (Q masks via 1-done);
-        #    fill in placeholders to keep shape contracts intact.
         if terminal:
-            next_state = {
+            # Q is masked by ``(1 - done)``, so the next-state contents
+            # are inert. Use the post-correction encoding + cached goal
+            # so the dict shape stays consistent.
+            terminal_obs_np = {
                 "z_obs": z_obs_after.squeeze(0).cpu().numpy(),
                 "z_goal": z_goal.squeeze(0).cpu().numpy(),
             }
-            return next_state, reward, True, info
+            info["final_observation"] = self._batch_obs_dict(terminal_obs_np)
 
-        # 5. Otherwise: roll the next cosmos cycle.
-        self._roll_cosmos_cycle()
-        return self._build_state(), reward, False, info
+            if auto_reset:
+                next_obs, _ = self.reset()
+            else:
+                next_obs = info["final_observation"]
+        else:
+            self._roll_cosmos_cycle()
+            next_obs = self._batched_state()
+
+        rewards = torch.tensor([reward], dtype=torch.float32)
+        terminations = torch.tensor([success], dtype=torch.bool)
+        truncations = torch.tensor([truncated], dtype=torch.bool)
+        return next_obs, rewards, terminations, truncations, info
+
+    def chunk_step(
+        self, chunk_actions: torch.Tensor
+    ) -> tuple[list[dict[str, torch.Tensor]], torch.Tensor, torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
+        """Roll a chunk of actions through ``step``.
+
+        ``chunk_actions`` has shape ``(num_envs=1, chunk_size, ACTION_DIM)``.
+        Inside the chunk we step with ``auto_reset=False`` so terminations
+        don't reset mid-chunk; once the chunk is done, if anything
+        terminated and ``cfg.auto_reset`` is set we tack on a reset and
+        rewrite the last entry to expose ``final_observation`` while
+        carrying the post-reset obs forward (mirrors LiberoEnv).
+        """
+        if isinstance(chunk_actions, torch.Tensor):
+            chunk_actions_np = chunk_actions.detach().cpu().numpy()
+        else:
+            chunk_actions_np = np.asarray(chunk_actions)
+        if chunk_actions_np.ndim != 3 or chunk_actions_np.shape[0] != 1:
+            raise ValueError(
+                f"chunk_actions must be (1, T, {ACTION_DIM}); got {chunk_actions_np.shape}"
+            )
+
+        chunk_size = chunk_actions_np.shape[1]
+        obs_list: list[dict[str, torch.Tensor]] = []
+        infos_list: list[dict[str, Any]] = []
+        rewards_list: list[torch.Tensor] = []
+        terminations_list: list[torch.Tensor] = []
+        truncations_list: list[torch.Tensor] = []
+        for t in range(chunk_size):
+            o, r, term, trunc, info = self.step(chunk_actions_np[:, t], auto_reset=False)
+            obs_list.append(o)
+            rewards_list.append(r)
+            terminations_list.append(term)
+            truncations_list.append(trunc)
+            infos_list.append(info)
+            # Stop rolling further actions through a sim that's already
+            # terminated -- libero/robosuite raises on step-after-done.
+            if bool(term.item()) or bool(trunc.item()):
+                break
+
+        # Pad the chunk back out to ``chunk_size`` if we broke early so
+        # downstream tensor shapes stay consistent.
+        while len(rewards_list) < chunk_size:
+            obs_list.append(obs_list[-1])
+            infos_list.append(infos_list[-1])
+            rewards_list.append(torch.zeros_like(rewards_list[-1]))
+            terminations_list.append(torch.zeros_like(terminations_list[-1]))
+            truncations_list.append(torch.zeros_like(truncations_list[-1]))
+
+        chunk_rewards = torch.stack(rewards_list, dim=1)  # (1, T)
+        chunk_terminations = torch.stack(terminations_list, dim=1)
+        chunk_truncations = torch.stack(truncations_list, dim=1)
+
+        # Post-chunk auto-reset: if anything terminated, reset and stash
+        # the terminal obs into ``final_observation`` so the worker can
+        # bootstrap correctly; the last ``obs_list`` entry becomes the
+        # post-reset state so the next chunk starts fresh.
+        any_done = bool(chunk_terminations.any().item() or chunk_truncations.any().item())
+        if any_done and getattr(self.cfg, "auto_reset", True):
+            terminal_obs = obs_list[-1]
+            reset_obs, _ = self.reset()
+            # ``final_info`` mirrors gymnasium's vec env contract.
+            # EnvWorker iterates ``final_info["episode"]`` unconditionally
+            # in the auto_reset branch, so an empty episode dict is
+            # required even when we don't surface custom episode metrics.
+            infos_list[-1] = {
+                **infos_list[-1],
+                "final_observation": terminal_obs,
+                "final_info": {"episode": {}},
+            }
+            obs_list[-1] = reset_obs
+
+        return obs_list, chunk_rewards, chunk_terminations, chunk_truncations, infos_list
 
     def close(self) -> None:
         try:
@@ -535,8 +624,32 @@ class LiberoCosmosCorrectionEnv(gym.Env):
         img_t = _preprocess_image_for_correction(observation["primary_image"])
         return encode_image_to_rl_token(self.cosmos_model, self.rl_token_ae, img_t)
 
-    def _build_state(self) -> dict[str, np.ndarray]:
-        """Encode current obs into the agent-facing state dict."""
-        z_obs = self._encode_obs(self._last_obs).squeeze(0).cpu().numpy()
-        z_goal = self._goal.goal_z_rl.squeeze(0).cpu().numpy()
-        return {"z_obs": z_obs, "z_goal": z_goal}
+    def _batched_state(self) -> dict[str, torch.Tensor]:
+        """Encode current obs into the agent-facing state dict with a
+        leading num_envs=1 dim. Tensors live on CPU; the worker pipeline
+        moves them to device as needed."""
+        z_obs = self._encode_obs(self._last_obs).detach().cpu()  # (1, 768)
+        z_goal = self._goal.goal_z_rl.detach().cpu()  # (1, 768)
+        return {"z_obs": z_obs.contiguous(), "z_goal": z_goal.contiguous()}
+
+    def _batch_obs_dict(self, obs_np: dict[str, np.ndarray]) -> dict[str, torch.Tensor]:
+        """Wrap a raw {z_obs, z_goal} numpy dict (no batch dim) into
+        the (1, ...) torch dict the worker pipeline expects."""
+        return {
+            k: torch.as_tensor(v, dtype=torch.float32).unsqueeze(0).contiguous()
+            for k, v in obs_np.items()
+        }
+
+    def _unbatch_action(self, actions: np.ndarray | torch.Tensor) -> np.ndarray:
+        """Validate ``(1, ACTION_DIM)`` shape and pull out the single env's
+        action as a numpy array."""
+        if isinstance(actions, torch.Tensor):
+            actions = actions.detach().cpu().numpy()
+        actions = np.asarray(actions)
+        if actions.shape == (ACTION_DIM,):
+            return actions  # tolerate already-flat input from chunk_step
+        if actions.shape != (1, ACTION_DIM):
+            raise ValueError(
+                f"action shape must be (1, {ACTION_DIM}); got {actions.shape}"
+            )
+        return actions[0]

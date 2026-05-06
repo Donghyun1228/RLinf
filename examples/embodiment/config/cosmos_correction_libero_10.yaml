@@ -74,10 +74,21 @@ algorithm:
     alpha_type: fixed_alpha
     initial_alpha: 0.0
 
+  # Inherited rollout-side sampling/length params -- our Gaussian actor
+  # ignores top_k / top_p / max_new_token, but the HF rollout worker
+  # reads them unconditionally so we keep placeholders.
   sampling_params:
     do_sample: True
     temperature_train: 1.0
     temperature_eval: 0.0
+    top_k: 50
+    top_p: 1.0
+    repetition_penalty: 1.0
+
+  length_params:
+    max_new_token: 6
+    max_length: 6
+    min_length: 1
 
 
 env:
@@ -97,6 +108,7 @@ rollout:
   model:
     # Mirrors actor.model so the rollout worker can shape inputs the same way.
     model_type: cosmos_correction
+    model_path: ""
     token_dim: 768
     action_dim: 6
     num_action_chunks: 1

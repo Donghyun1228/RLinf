@@ -103,13 +103,21 @@ class EnvOutput:
             else None
         )
 
-        return {
+        prepared: dict[str, Any] = {
             "main_images": image_tensor,  # [N_ENV, H, W, C]
             "wrist_images": wrist_image_tensor,  # [N_ENV, H, W, C] or [N_ENV, N_IMG, H, W, C]
             "extra_view_images": extra_view_image_tensor,  # [N_ENV, N_IMG, H, W, C]
             "states": states,
             "task_descriptions": task_descriptions,
         }
+        # Pass through any additional keys (e.g. RL-token observations
+        # like ``z_obs`` / ``z_goal``) so envs with non-image schemas
+        # don't have their obs silently zeroed out by the standard slot
+        # filter above.
+        for key, value in obs.items():
+            if key not in prepared:
+                prepared[key] = value
+        return prepared
 
     @staticmethod
     def merge_env_outputs(env_outputs: list[dict]) -> dict[str, Any]:

@@ -104,6 +104,10 @@ class EmbodiedCosmosCorrectionFSDPPolicy(EmbodiedSACFSDPPolicy):
         self.entropy_temp = None
         self.alpha_optimizer = None
 
+        # SAC parent's init_worker checks ``self.use_dsrl`` after setup;
+        # cosmos+correction never uses the openpi DSRL path.
+        self.use_dsrl = False
+
         self.build_lr_schedulers()
         self.grad_scaler = self.build_grad_scaler(
             self.cfg.actor.fsdp_config.grad_scaler

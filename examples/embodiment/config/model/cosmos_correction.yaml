@@ -1,5 +1,10 @@
 model_type: "cosmos_correction"
 
+# No external HF checkpoint; the wrapper builds a fresh CorrectionPolicy
+# (zero-init pass-through). Kept as an empty string so the RLinf rollout
+# worker's ``rollout_model_config.model_path = ...`` assignment succeeds.
+model_path: ""
+
 # Wrapper interface (consumed by `rlinf.models.embodiment.cosmos_correction.get_model`)
 token_dim: 768
 action_dim: 6
@@ -16,6 +21,10 @@ precision: "32"
 # head are needed -- the wrapper bundles its own twin-Q critic.
 add_value_head: False
 add_q_head: False
+
+# Tiny actor-critic head; LoRA does not apply.
+is_lora: False
+lora_rank: 0
 
 # FSDP
 sharding_strategy: no_shard

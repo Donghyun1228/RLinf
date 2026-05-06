@@ -32,8 +32,18 @@ env_resolution: 256
 # EnvWorker / RLinf-side fields (single-env for now; multi-env requires
 # sharing the cosmos model across envs in the same process and is deferred).
 total_num_envs: 1
-auto_reset: False
+group_size: 1
+# Auto-reset on chunk termination so EnvWorker can keep rolling
+# without an explicit reset call. The terminal obs is preserved in
+# ``info["final_observation"]`` for bootstrapping the Q target.
+auto_reset: True
 ignore_terminations: False
+# 520 is the official libero_10 horizon used by cosmos
+# (third_party/cosmos-policy/.../run_libero_eval.py: "longest training
+# demo has 505 steps"). Keep this aligned with ``max_episode_steps``.
+max_steps_per_rollout_epoch: 520
+
+seed: 0
 
 video_cfg:
   save_video: True

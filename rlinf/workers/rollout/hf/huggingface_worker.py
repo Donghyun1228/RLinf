@@ -537,8 +537,17 @@ class MultiStepRolloutWorker(Worker):
     @staticmethod
     def _infer_env_batch_size(obs_batch: dict[str, Any]) -> int:
         obs = obs_batch["obs"] if "obs" in obs_batch else obs_batch
+        # Priority keys for the standard image+state envs.
         for key in ("states", "main_images", "task_descriptions"):
             value = obs.get(key)
+            if isinstance(value, torch.Tensor):
+                return value.shape[0]
+            if isinstance(value, list):
+                return len(value)
+        # Fallback: any tensor / list in the dict carries the batch dim
+        # in slot 0. Lets envs with custom obs schemas (e.g. RL tokens)
+        # plug in without modifying the priority list.
+        for value in obs.values():
             if isinstance(value, torch.Tensor):
                 return value.shape[0]
             if isinstance(value, list):

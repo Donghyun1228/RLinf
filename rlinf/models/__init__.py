@@ -76,6 +76,11 @@ def _register_builtin_models():
 
         return get_model(cfg, torch_dtype)
 
+    def _build_cosmos_correction(cfg: DictConfig, torch_dtype):
+        from rlinf.models.embodiment.cosmos_correction import get_model
+
+        return get_model(cfg, torch_dtype)
+
     def _build_gr00t(cfg: DictConfig, torch_dtype):
         from rlinf.models.embodiment.gr00t import get_model
 
@@ -196,6 +201,12 @@ def _register_builtin_models():
     register_model(
         SupportedModel.COSMOS_POLICY.value,
         _build_cosmos_policy,
+        category="embodied",
+        force=True,
+    )
+    register_model(
+        SupportedModel.COSMOS_CORRECTION.value,
+        _build_cosmos_correction,
         category="embodied",
         force=True,
     )

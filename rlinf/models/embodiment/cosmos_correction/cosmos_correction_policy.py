@@ -163,7 +163,12 @@ class CosmosCorrectionPolicy(nn.Module, BasePolicy):
 
         forward_inputs = {"action": action, "model_action": action}
         if return_obs:
-            forward_inputs["obs"] = obs
+            # Flatten the obs dict into top-level tensor entries: the
+            # rollout worker's per-shard split only handles tensor
+            # values in ``forward_inputs``. Stash both keys directly so
+            # downstream rebuilds the obs as ``{z_obs, z_goal}``.
+            forward_inputs["z_obs"] = obs["z_obs"]
+            forward_inputs["z_goal"] = obs["z_goal"]
 
         result = {
             "prev_logprobs": torch.zeros(

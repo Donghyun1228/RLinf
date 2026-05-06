@@ -74,54 +74,64 @@ def env():
     e.close()
 
 
-def _check_state(state: dict[str, np.ndarray]) -> None:
+def _check_state(state: dict) -> None:
     assert set(state.keys()) == {"z_obs", "z_goal"}
     for key in ("z_obs", "z_goal"):
         v = state[key]
-        assert v.shape == (TOKEN_DIM,), f"{key}: {v.shape}"
-        assert v.dtype == np.float32 or np.issubdtype(v.dtype, np.floating)
-        assert np.isfinite(v).all(), f"{key} has non-finite entries"
+        # RLinf vec env: leading num_envs=1 dim.
+        assert v.shape == (1, TOKEN_DIM), f"{key}: {v.shape}"
+        v_np = v.detach().cpu().numpy() if hasattr(v, "detach") else v
+        assert np.issubdtype(v_np.dtype, np.floating)
+        assert np.isfinite(v_np).all(), f"{key} has non-finite entries"
 
 
 def test_reset_returns_correct_state_shape(env):
-    state = env.reset()
+    state, info = env.reset()
     _check_state(state)
+    assert "task_id" in info and "trial_id" in info
 
 
 def test_zero_correction_steps_terminate_with_expected_info(env):
-    state = env.reset()
+    state, _ = env.reset()
     _check_state(state)
 
-    zero_action = np.zeros(ACTION_DIM, dtype=np.float32)
+    zero_action = np.zeros((1, ACTION_DIM), dtype=np.float32)
 
-    # Run a handful of cycles with zero correction (cosmos baseline only).
-    rewards = []
-    for i in range(3):
-        next_state, reward, done, info = env.step(zero_action)
+    for _ in range(3):
+        next_state, reward, term, trunc, info = env.step(
+            zero_action, auto_reset=False
+        )
         _check_state(next_state)
 
-        assert isinstance(reward, float)
-        assert np.isfinite(reward)
+        assert reward.shape == (1,) and np.isfinite(reward.numpy()).all()
+        assert term.shape == (1,) and trunc.shape == (1,)
         assert "dense_reward" in info and "sparse_reward" in info
         assert "success" in info and "truncated" in info
         assert -1.0 - 1e-3 <= info["dense_reward"] <= 1.0 + 1e-3, (
             f"cos-sim should be in [-1, 1], got {info['dense_reward']}"
         )
 
-        rewards.append(reward)
-        state = next_state
-        if done:
+        if bool(term.item()) or bool(trunc.item()):
             assert info["success"] or info["truncated"]
             break
-    else:
-        # Loop exhausted without termination — fine for the smoke test.
-        pass
+
+
+def test_chunk_step_runs_one_step_chunk(env):
+    """num_action_chunks=1 -> chunk_step degenerates to a single step."""
+    env.reset()
+    chunk_actions = np.zeros((1, 1, ACTION_DIM), dtype=np.float32)
+    obs_list, rewards, term, trunc, infos = env.chunk_step(chunk_actions)
+    assert len(obs_list) == 1
+    _check_state(obs_list[0])
+    assert rewards.shape == (1, 1)
+    assert term.shape == (1, 1) and trunc.shape == (1, 1)
+    assert len(infos) == 1
 
 
 def test_action_dim_validation(env):
     env.reset()
     with pytest.raises(ValueError, match="action shape"):
-        env.step(np.zeros(7, dtype=np.float32))
+        env.step(np.zeros((1, 7), dtype=np.float32))
 
 
 def test_get_env_cls_dispatch():
