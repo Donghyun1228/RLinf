@@ -15,12 +15,12 @@ hydra:
 
 cluster:
   num_nodes: 1
-  # 4 env worker processes on GPU 0 (`0:0-3` = resource rank 0,
-  # process ranks 0-3 sharing it). Cosmos VLA lives in a separate
+  # 8 env worker processes on GPU 0 (`0:0-7` = resource rank 0,
+  # process ranks 0-7 sharing it). Cosmos VLA lives in a separate
   # named Ray actor so all env workers RPC into the same model
   # without each loading their own 8GB copy.
   component_placement:
-    env: 0:0-3
+    env: 0:0-7
     actor,rollout: 0
 
 
@@ -35,13 +35,24 @@ runner:
     # the local tensorboard event files.
     logger_backends: ["tensorboard", "wandb"]
 
-  max_epochs: 100
+  max_epochs: 500
   max_steps: -1
 
   only_eval: False
-  val_check_interval: 200
-  save_interval: -1
-  weight_sync_interval: 30
+  # eval disabled (val_check_interval <= 0). Train-time success rate is
+  # tracked via env metrics in the rollout loop; a separate eval pass
+  # would double the wall time without much added signal at this stage.
+  val_check_interval: -1
+  # Save every 25 outer epochs → 4 checkpoints over 500 epochs
+  # (epoch 25/75/125/175/225/275/325/375/425/475). Actor checkpoint covers correction policy +
+  # twin Q + optimizer state, ~tens of MB each, so storage is trivial.
+  save_interval: 25
+  # Correction policy + twin Q is ~10MB; cosmos VLA is in a separate
+  # Ray actor and not synced. Per-step sync overhead is negligible
+  # (delta encoding + CPU transport) compared to the outer-epoch cost,
+  # so push fresh weights to rollout every step instead of letting it
+  # drift 30 epochs behind the actor.
+  weight_sync_interval: 1
 
 
 algorithm:

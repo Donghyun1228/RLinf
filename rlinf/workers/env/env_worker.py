@@ -239,6 +239,14 @@ class EnvWorker(Worker):
             )
             if env_cfg.video_cfg.save_video:
                 env = RecordVideo(env, env_cfg.video_cfg)
+                # Some envs push frames per inner sim step themselves
+                # (e.g., libero_cosmos_correction expands a single
+                # chunk_step into ~17 LIBERO sim steps and wants one
+                # frame per sim step + per-episode mp4 flushing). Hand
+                # those envs the wrapper handle so they can call into
+                # render_images / flush_video directly.
+                if hasattr(env.env, "register_video_wrapper"):
+                    env.env.register_video_wrapper(env)
             if env_cfg.get("data_collection", None) and getattr(
                 env_cfg.data_collection, "enabled", False
             ):

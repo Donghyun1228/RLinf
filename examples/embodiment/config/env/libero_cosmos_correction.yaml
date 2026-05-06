@@ -19,9 +19,15 @@ cosmos_seed: 0
 # RL-token autoencoder checkpoint (Phase-0 prep)
 rl_token_ae_ckpt_path: ${oc.env:HOME}/donghyun/checkpoints/rl-token-ae/best.pt
 
-# Reward (z_obs_after vs z_goal cos-sim + sparse success bonus)
+# Reward (z_obs_after vs z_goal cos-sim + sparse success bonus).
+# In high-dim AE space z_obs_after and z_goal are near-orthogonal,
+# so dense cos-sim accumulates to ~1 per episode in practice (not 30).
+# Match the sparse magnitude to that scale so success transitions
+# don't dominate the critic with +100 spikes — the relative
+# success/failure separation is what matters for the gradient, and
+# small absolute magnitudes give a much more readable critic loss.
 dense_coef: 1.0
-success_bonus: 100.0
+success_bonus: 1.0
 
 # Stabilization
 num_steps_wait_after_reset: 10
@@ -31,17 +37,21 @@ env_resolution: 256
 
 # EnvWorker / RLinf-side fields (single-env for now; multi-env requires
 # sharing the cosmos model across envs in the same process and is deferred).
-total_num_envs: 4   # one per env worker (4 env workers on GPU 0)
+total_num_envs: 8   # one per env worker (8 env workers on GPU 0)
 group_size: 1
 # Auto-reset on chunk termination so EnvWorker can keep rolling
 # without an explicit reset call. The terminal obs is preserved in
 # ``info["final_observation"]`` for bootstrapping the Q target.
 auto_reset: True
 ignore_terminations: False
-# 520 is the official libero_10 horizon used by cosmos
-# (third_party/cosmos-policy/.../run_libero_eval.py: "longest training
-# demo has 505 steps"). Keep this aligned with ``max_episode_steps``.
-max_steps_per_rollout_epoch: 520
+# Outer-epoch length in *correction* MDP steps (not LIBERO sim steps).
+# Each chunk_step in this env advances ~17 LIBERO sim steps internally
+# (1 correction + 16 cosmos open-loop), so 30 correction steps ≈ 510
+# sim steps ≈ one libero_10 truncation horizon. Matches the convention
+# in other libero configs where outer epoch ≈ one episode's worth of
+# sim steps; if an episode succeeds early, the remainder is filled by
+# the next episode's prefix.
+max_steps_per_rollout_epoch: 30
 
 seed: 0
 

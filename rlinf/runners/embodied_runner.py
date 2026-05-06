@@ -90,6 +90,12 @@ class EmbodiedRunner:
         # the step here is GRPO step
         self.global_step = 0
 
+        # Cumulative episode counters surfaced as env/<key>_cumulative so
+        # we can read the run-wide success rate from a single point on
+        # the wandb chart instead of squinting at the noisy per-epoch line.
+        self._cum_episode_counts: int = 0
+        self._cum_episode_sums: dict[str, float] = {}
+
         # compute `max_steps`
         self.set_max_steps()
 
@@ -376,7 +382,28 @@ class EmbodiedRunner:
                 results for results in env_results if results is not None
             ]
             env_metrics = compute_evaluate_metrics(env_results_list)
+            # Update run-wide cumulative episode means before prefixing.
+            # ``num_trajectories`` is the count of terminated episodes
+            # this outer epoch (across all workers); the other scalars
+            # are per-epoch means weighted by that count.
+            epoch_episodes = int(env_metrics.get("num_trajectories", 0) or 0)
+            if epoch_episodes > 0:
+                self._cum_episode_counts += epoch_episodes
+                for k, v in env_metrics.items():
+                    if k == "num_trajectories":
+                        continue
+                    self._cum_episode_sums[k] = (
+                        self._cum_episode_sums.get(k, 0.0) + float(v) * epoch_episodes
+                    )
+            cumulative_metrics = {
+                f"env/{k}_cumulative": (
+                    self._cum_episode_sums[k] / self._cum_episode_counts
+                )
+                for k in self._cum_episode_sums
+                if self._cum_episode_counts > 0
+            }
             env_metrics = {f"env/{k}": v for k, v in env_metrics.items()}
+            env_metrics.update(cumulative_metrics)
             ranked_env_results = [
                 {"rank": rank, "env": rank_metrics}
                 for rank, rank_metrics in enumerate(env_results)

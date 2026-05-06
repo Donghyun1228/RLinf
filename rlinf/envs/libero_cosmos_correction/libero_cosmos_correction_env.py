@@ -318,6 +318,21 @@ class LiberoCosmosCorrectionEnv(gym.Env):
         self._cosmos_action_chunk: Optional[np.ndarray] = None  # (1, T, 7) numpy
         self._step_count: int = 0
         self._last_obs: Any = None  # raw libero obs, kept for prepare_observation
+        # Episode-level accumulators surfaced via final_info["episode"] so
+        # env_worker can log env/success / env/return / env/episode_len.
+        # Dense and sparse are split out so we can tell whether the
+        # policy is gaming cos-sim hovering vs. actually hitting success.
+        self._episode_return: float = 0.0
+        self._episode_dense_return: float = 0.0
+        self._episode_sparse_return: float = 0.0
+        self._episode_success: bool = False
+        # Set by env_worker after the RecordVideo wrapper is constructed.
+        # When present, we push a frame per LIBERO sim step (16 cosmos +
+        # 1 correction, ~17 frames per chunk_step) directly into the
+        # wrapper instead of the wrapper's default 1-frame-per-chunk_step
+        # capture. flush_video() is called per episode so each mp4 is
+        # one episode rather than one outer epoch.
+        self._video_wrapper: Optional[Any] = None
 
     def _build_libero_for_task(self, task_id: int) -> None:
         """(Re)build the underlying LIBERO sim for ``task_id``.
@@ -371,6 +386,24 @@ class LiberoCosmosCorrectionEnv(gym.Env):
             )
         self._last_obs = obs
         self._step_count = 0
+        self._episode_return = 0.0
+        self._episode_dense_return = 0.0
+        self._episode_sparse_return = 0.0
+        self._episode_success = False
+
+        # First frame of the new episode so the per-episode mp4 starts
+        # at the post-stabilization initial state, not at the cosmos
+        # rollout's first chunk step.
+        self._push_video_frame(
+            info_overlay={
+                "step": 0,
+                "phase": "reset",
+                "task_id": self._current_task_id,
+                "trial_id": self._current_trial_id,
+            },
+            reward=None,
+            termination=False,
+        )
 
         self._roll_cosmos_cycle()
         info = {
@@ -431,7 +464,13 @@ class LiberoCosmosCorrectionEnv(gym.Env):
             ).item()
         )
         sparse = self.cfg.success_bonus if success else 0.0
-        reward = self.cfg.dense_coef * dense + sparse
+        dense_term = self.cfg.dense_coef * dense
+        reward = dense_term + sparse
+        self._episode_return += float(reward)
+        self._episode_dense_return += float(dense_term)
+        self._episode_sparse_return += float(sparse)
+        if success:
+            self._episode_success = True
 
         info: dict[str, Any] = {
             "dense_reward": dense,
@@ -443,6 +482,11 @@ class LiberoCosmosCorrectionEnv(gym.Env):
             "trial_id": self._current_trial_id,
             "task_description": self._task_description,
         }
+
+        # Capture the post-correction frame with full overlay info.
+        self._push_video_frame(
+            info_overlay=info, reward=reward, termination=success
+        )
 
         if terminal:
             # Q is masked by ``(1 - done)``, so the next-state contents
@@ -526,15 +570,37 @@ class LiberoCosmosCorrectionEnv(gym.Env):
         any_done = bool(chunk_terminations.any().item() or chunk_truncations.any().item())
         if any_done and getattr(self.cfg, "auto_reset", True):
             terminal_obs = obs_list[-1]
+            # Snapshot episode-level metrics BEFORE reset() zeros the
+            # accumulators. env_worker indexes these with
+            # ``chunk_dones[:, -1]`` so values must be num_envs-shaped (=1).
+            episode_metrics = {
+                "success": torch.tensor([self._episode_success], dtype=torch.bool),
+                "return": torch.tensor([self._episode_return], dtype=torch.float32),
+                "dense_return": torch.tensor(
+                    [self._episode_dense_return], dtype=torch.float32
+                ),
+                "sparse_return": torch.tensor(
+                    [self._episode_sparse_return], dtype=torch.float32
+                ),
+                "episode_len": torch.tensor([self._step_count], dtype=torch.int32),
+            }
+            # Per-episode mp4: flush the wrapper's frame buffer BEFORE
+            # resetting so this video covers exactly the just-finished
+            # episode. Subsequent reset frames go into the next mp4.
+            if self._video_wrapper is not None:
+                sub_dir = f"task_{self._current_task_id}"
+                try:
+                    self._video_wrapper.flush_video(video_sub_dir=sub_dir)
+                except Exception as exc:  # noqa: BLE001
+                    # Don't crash the env on a flush failure -- training
+                    # is the priority; the wrapper's internal warnings
+                    # already log the cause.
+                    print(f"[libero_cosmos_correction] flush_video failed: {exc}")
             reset_obs, _ = self.reset()
-            # ``final_info`` mirrors gymnasium's vec env contract.
-            # EnvWorker iterates ``final_info["episode"]`` unconditionally
-            # in the auto_reset branch, so an empty episode dict is
-            # required even when we don't surface custom episode metrics.
             infos_list[-1] = {
                 **infos_list[-1],
                 "final_observation": terminal_obs,
-                "final_info": {"episode": {}},
+                "final_info": {"episode": episode_metrics},
             }
             obs_list[-1] = reset_obs
 
@@ -556,20 +622,63 @@ class LiberoCosmosCorrectionEnv(gym.Env):
         return 1
 
     def capture_image(self) -> Optional[np.ndarray]:
-        """Render the current libero scene for the video wrapper.
+        """No-op for the RecordVideo wrapper's automatic chunk_step capture.
 
-        Returns the agentview image of the last raw libero obs as a
-        ``(H, W, 3)`` uint8 array, or ``None`` if no obs is cached yet.
+        We push frames per LIBERO sim step ourselves via ``_push_video_frame``
+        (called inside ``step`` and ``_roll_cosmos_cycle``), so returning
+        None here disables the wrapper's default 1-frame-per-chunk_step
+        capture and avoids a duplicate at the end of each chunk.
+        """
+        return None
+
+    def register_video_wrapper(self, wrapper: Any) -> None:
+        """Receive the RecordVideo wrapper handle from env_worker.
+
+        Called once after construction so subsequent sim-step frames can
+        be pushed straight into ``wrapper.render_images``. With no
+        wrapper registered (e.g., ``save_video: False``), all the video
+        machinery in this file becomes a no-op.
+        """
+        self._video_wrapper = wrapper
+
+    def _render_libero_frame(self) -> Optional[np.ndarray]:
+        """Render the current libero scene as ``(H, W, 3)`` uint8 RGB.
+
+        Returns None if no obs is cached. libero stores images flipped
+        vertically; flipud + ascontiguous to match playback expectations.
         """
         if self._last_obs is None or "agentview_image" not in self._last_obs:
             return None
         img = self._last_obs["agentview_image"]
         if not isinstance(img, np.ndarray):
             img = np.asarray(img)
-        # libero stores images flipped vertically; flipud + ascontiguous
-        # to match what humans expect when watching back.
         img = np.flipud(img)
         return np.ascontiguousarray(img.astype(np.uint8))
+
+    def _push_video_frame(
+        self,
+        info_overlay: Optional[dict] = None,
+        reward: Optional[float] = None,
+        termination: Optional[bool] = None,
+    ) -> None:
+        """Push one frame to the wrapper. Skips if no wrapper registered."""
+        if self._video_wrapper is None:
+            return
+        frame = self._render_libero_frame()
+        if frame is None:
+            return
+        # Reuse the wrapper's overlay/tile path so the result lines up
+        # with how it would have rendered through capture_image normally.
+        try:
+            self._video_wrapper._append_frame(
+                images=[frame],
+                infos=info_overlay,
+                rewards=reward,
+                terminations=termination,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Skip a bad frame rather than killing the rollout.
+            print(f"[libero_cosmos_correction] _append_frame failed: {exc}")
 
     # ------------------------------------------------------------------
     # internals
@@ -613,6 +722,17 @@ class LiberoCosmosCorrectionEnv(gym.Env):
             obs, _, done, _ = self._libero_env.step(chunk_np[t].tolist())
             self._step_count += 1
             self._last_obs = obs
+            self._push_video_frame(
+                info_overlay={
+                    "step": self._step_count,
+                    "phase": "cosmos",
+                    "cosmos_chunk_step": t,
+                    "task_id": self._current_task_id,
+                    "trial_id": self._current_trial_id,
+                },
+                reward=None,
+                termination=bool(done),
+            )
             if done:
                 # Chunk solved the task before we could even fire a
                 # correction. We let the *next* step() see done=True via
