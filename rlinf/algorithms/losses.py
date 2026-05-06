@@ -459,3 +459,49 @@ def compute_grpo_actor_loss_fn(**kwargs) -> tuple[torch.Tensor, dict]:
     metrics_data.update(actor_metrics_data)
 
     return actor_loss, metrics_data
+
+
+@register_policy_loss("correction_td3_bc")
+def compute_correction_td3_bc_actor_loss(
+    *,
+    mean_action: torch.Tensor,
+    q_values: torch.Tensor,
+    bc_coef: float = 1.0,
+    **kwargs,
+) -> tuple[torch.Tensor, dict]:
+    """TD3+BC actor loss for the cosmos+correction policy.
+
+        L = -min(Q1, Q2)(s, mu(s)) + bc_coef * mean(mu(s)**2)
+
+    The ``||mu||^2`` term anchors the correction toward zero, which
+    in our env composition means "no extra movement on top of the
+    cosmos chunk". Critic-side updates (target network, twin-Q TD
+    target with policy noise) live in the off-policy worker; this
+    function only consumes a precomputed Q tensor.
+
+    Args:
+        mean_action: Actor's deterministic mean ``mu(s)``, shape
+            ``(B, chunk_size, action_dim)`` -- the wrapper exposes
+            this in ``sac_forward(...)``'s ``info["mean"]``.
+        q_values: Twin-Q output for ``(s, mu(s))``, shape
+            ``(B, num_critics)``. The min along the last dim is the
+            actor's Q estimate.
+        bc_coef: Weight on the ``||mu||^2`` anchor term (``beta`` in
+            the TD3+BC paper).
+
+    Returns:
+        ``(loss, metrics)``.
+    """
+    q_min = q_values.min(dim=-1).values  # (B,)
+    q_term = -q_min.mean()
+    bc_term = mean_action.pow(2).mean()
+    loss = q_term + bc_coef * bc_term
+
+    metrics_data = {
+        "actor/loss": loss.detach(),
+        "actor/q_term": q_term.detach(),
+        "actor/bc_term": bc_term.detach(),
+        "actor/q_min_mean": q_min.mean().detach(),
+        "actor/mean_action_abs": mean_action.abs().mean().detach(),
+    }
+    return loss, metrics_data
