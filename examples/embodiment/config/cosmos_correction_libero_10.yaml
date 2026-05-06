@@ -1,0 +1,142 @@
+defaults:
+  - env/libero_cosmos_correction@env.train
+  - env/libero_cosmos_correction@env.eval
+  - model/cosmos_correction@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - weight_syncer/patch_syncer@weight_syncer
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    env,actor,rollout: 0
+
+
+runner:
+  task_type: embodied
+  logger:
+    log_path: "../results/cosmos_correction_libero_10"
+    project_name: rlinf
+    experiment_name: "cosmos_correction_libero_10"
+    logger_backends: ["tensorboard"]
+
+  max_epochs: 5000
+  max_steps: -1
+
+  only_eval: False
+  val_check_interval: 200
+  save_interval: -1
+  weight_sync_interval: 30
+
+
+algorithm:
+  # Loss / advantage selectors that drive the worker dispatch.
+  # `correction_td3_bc` is registered in `rlinf/algorithms/losses.py` and
+  # picked up by `train_embodied_agent.py` to instantiate
+  # `EmbodiedCosmosCorrectionFSDPPolicy`.
+  loss_type: correction_td3_bc
+  adv_type: embodied_sac          # placeholder; off-policy, no advantages
+  loss_agg_func: "token-mean"
+
+  update_epoch: 1
+  group_size: 1
+
+  # TD3+BC core
+  gamma: 0.99
+  tau: 0.005
+  bc_coef: 1.0
+  target_policy_noise: 0.2
+  target_noise_clip: 0.5
+  target_action_clip: 1.0
+  target_update_freq: 1
+  critic_actor_ratio: 2
+  bootstrap_type: standard
+
+  # Replay buffer
+  replay_buffer:
+    enable_cache: True
+    cache_size: 20000
+    sample_window_size: 20000
+    min_buffer_size: 32
+    auto_save: False
+
+  target_update_type: all
+
+  # Inherited from SAC base; unused for TD3+BC but kept so YAML parses.
+  entropy_tuning:
+    alpha_type: fixed_alpha
+    initial_alpha: 0.0
+
+  sampling_params:
+    do_sample: True
+    temperature_train: 1.0
+    temperature_eval: 0.0
+
+
+env:
+  group_name: "EnvGroup"
+  # train.* and eval.* come from defaults: env/libero_cosmos_correction
+
+
+rollout:
+  group_name: "RolloutGroup"
+  backend: "huggingface"
+  enable_offload: False
+  pipeline_stage_num: 1
+  collect_transitions: True
+  collect_prev_infos: False
+  enable_torch_compile: False
+  enable_cuda_graph: False
+  model:
+    # Mirrors actor.model so the rollout worker can shape inputs the same way.
+    model_type: cosmos_correction
+    token_dim: 768
+    action_dim: 6
+    num_action_chunks: 1
+    precision: ${actor.model.precision}
+
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 64
+  global_batch_size: 64
+  seed: 42
+  enable_offload: False
+  enable_drq: False
+  compile_model: False
+
+  # actor.model.* comes from defaults: model/cosmos_correction
+
+  optim:
+    clip_grad: 10.0
+    lr: 3e-4
+    lr_scheduler: torch_constant
+
+  critic_optim:
+    clip_grad: 10.0
+    lr: 3e-4
+    lr_scheduler: torch_constant
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    use_orig_params: True
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False

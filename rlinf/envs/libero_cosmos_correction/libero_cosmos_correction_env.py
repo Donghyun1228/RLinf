@@ -42,7 +42,7 @@ wrapper or by sharing a batched cosmos call across N envs.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Optional
 
@@ -170,6 +170,10 @@ class LiberoCosmosCorrectionEnvCfg:
     # Task
     task_suite_name: str = "libero_10"
     task_id: int = 0
+    # If non-empty, ``reset()`` samples a task id from this list each
+    # episode, rebuilding the underlying LIBERO sim. Lets one env worker
+    # cycle through the full suite without a vec wrapper.
+    task_ids: list[int] = field(default_factory=list)
     max_episode_steps: int = 520
 
     # Cosmos checkpoint (HF repo id; assets resolved from local HF cache)
@@ -193,14 +197,49 @@ class LiberoCosmosCorrectionEnvCfg:
     env_resolution: int = 256
 
 
+def _coerce_env_cfg(cfg: Any) -> LiberoCosmosCorrectionEnvCfg:
+    """Accept either the dataclass directly (smoke tests) or a DictConfig
+    coming from the RLinf YAML pipeline (EnvWorker)."""
+    if isinstance(cfg, LiberoCosmosCorrectionEnvCfg):
+        return cfg
+    from omegaconf import OmegaConf
+
+    if hasattr(cfg, "_content") or hasattr(cfg, "to_container"):
+        as_dict = OmegaConf.to_container(cfg, resolve=True)
+    elif isinstance(cfg, dict):
+        as_dict = dict(cfg)
+    else:
+        raise TypeError(f"unsupported env cfg type: {type(cfg).__name__}")
+    valid_fields = {f.name for f in fields(LiberoCosmosCorrectionEnvCfg)}
+    filtered = {k: v for k, v in as_dict.items() if k in valid_fields}
+    return LiberoCosmosCorrectionEnvCfg(**filtered)
+
+
 class LiberoCosmosCorrectionEnv(gym.Env):
     """Single LIBERO env wrapped with the cosmos+correction loop."""
 
     metadata = {"render.modes": []}
 
-    def __init__(self, cfg: LiberoCosmosCorrectionEnvCfg):
+    def __init__(
+        self,
+        cfg: LiberoCosmosCorrectionEnvCfg | Any,
+        num_envs: int = 1,
+        seed_offset: int = 0,
+        total_num_processes: int = 1,
+        worker_info: Any = None,
+    ):
         super().__init__()
-        self.cfg = cfg
+        if num_envs != 1:
+            raise NotImplementedError(
+                f"LiberoCosmosCorrectionEnv only supports num_envs=1; got {num_envs}. "
+                "Multi-env support requires sharing the cosmos model across envs "
+                "and is deferred to a follow-up."
+            )
+        self.cfg = _coerce_env_cfg(cfg)
+        self._seed_offset = seed_offset
+        self._total_num_processes = total_num_processes
+        self._worker_info = worker_info
+        cfg = self.cfg  # rebind so the rest of __init__ sees the dataclass
 
         # gym spaces -- the agent sees pre-encoded RL tokens, not raw obs.
         self.observation_space = gym.spaces.Dict(
@@ -242,24 +281,54 @@ class LiberoCosmosCorrectionEnv(gym.Env):
         for p in self.rl_token_ae.parameters():
             p.requires_grad_(False)
 
-        # LIBERO env
+        # LIBERO benchmark: keep the suite handle so ``reset()`` can
+        # rebuild the sim against a different task on demand.
         os.environ.setdefault("MUJOCO_GL", "egl")
-        bench = benchmark.get_benchmark_dict()[cfg.task_suite_name]()
-        if not (0 <= cfg.task_id < bench.n_tasks):
-            raise ValueError(
-                f"task_id {cfg.task_id} out of range [0, {bench.n_tasks}) "
-                f"for suite {cfg.task_suite_name}"
-            )
-        task = bench.get_task(cfg.task_id)
-        self._libero_env, self._task_description = get_libero_env(
-            task, "cosmos", resolution=cfg.env_resolution
-        )
+        self._bench = benchmark.get_benchmark_dict()[cfg.task_suite_name]()
+        n_tasks = self._bench.n_tasks
+        if cfg.task_ids:
+            for tid in cfg.task_ids:
+                if not (0 <= tid < n_tasks):
+                    raise ValueError(
+                        f"task_id {tid} out of range [0, {n_tasks}) "
+                        f"for suite {cfg.task_suite_name}"
+                    )
+            self._task_pool = list(cfg.task_ids)
+        else:
+            if not (0 <= cfg.task_id < n_tasks):
+                raise ValueError(
+                    f"task_id {cfg.task_id} out of range [0, {n_tasks}) "
+                    f"for suite {cfg.task_suite_name}"
+                )
+            self._task_pool = [cfg.task_id]
+        self._task_rng = np.random.default_rng(seed_offset)
+        self._current_task_id: Optional[int] = None
+        self._libero_env = None
+        self._task_description = ""
+        self._build_libero_for_task(self._task_pool[0])
 
         # Per-cycle state (filled in reset / step)
         self._goal: Optional[GoalState] = None
         self._cosmos_action_chunk: Optional[torch.Tensor] = None  # (1, T, 7)
         self._step_count: int = 0
         self._last_obs: Any = None  # raw libero obs, kept for prepare_observation
+
+    def _build_libero_for_task(self, task_id: int) -> None:
+        """(Re)build the underlying LIBERO sim for ``task_id``.
+
+        We close the previous sim if any so MuJoCo doesn't leak GL
+        contexts when cycling tasks across episodes.
+        """
+        if self._libero_env is not None:
+            try:
+                self._libero_env.close()
+            except Exception:
+                pass
+        task = self._bench.get_task(task_id)
+        self._libero_env, self._task_description = get_libero_env(
+            task, "cosmos", resolution=self.cfg.env_resolution
+        )
+        self._current_task_id = task_id
 
     # ------------------------------------------------------------------
     # gym.Env interface
@@ -268,8 +337,15 @@ class LiberoCosmosCorrectionEnv(gym.Env):
         """Reset libero env + run the first cosmos cycle.
 
         Returns the initial state ``{"z_obs", "z_goal"}`` as numpy
-        float32 arrays, matching the configured observation space.
+        float32 arrays, matching the configured observation space. If
+        ``cfg.task_ids`` has more than one entry, a new task is sampled
+        and the underlying LIBERO sim is rebuilt before the reset.
         """
+        if len(self._task_pool) > 1:
+            new_task_id = int(self._task_rng.choice(self._task_pool))
+            if new_task_id != self._current_task_id:
+                self._build_libero_for_task(new_task_id)
+
         obs = self._libero_env.reset()
         for _ in range(self.cfg.num_steps_wait_after_reset):
             obs, _, _, _ = self._libero_env.step(
@@ -337,6 +413,8 @@ class LiberoCosmosCorrectionEnv(gym.Env):
             "success": success,
             "truncated": truncated,
             "step": self._step_count,
+            "task_id": self._current_task_id,
+            "task_description": self._task_description,
         }
 
         # 4. If terminal, the next state is unused (Q masks via 1-done);
@@ -357,6 +435,31 @@ class LiberoCosmosCorrectionEnv(gym.Env):
             self._libero_env.close()
         except Exception:
             pass
+
+    @property
+    def seed(self) -> int:
+        """Used by the RecordVideo wrapper to namespace output files."""
+        return int(self._seed_offset)
+
+    @property
+    def num_envs(self) -> int:
+        return 1
+
+    def capture_image(self) -> Optional[np.ndarray]:
+        """Render the current libero scene for the video wrapper.
+
+        Returns the agentview image of the last raw libero obs as a
+        ``(H, W, 3)`` uint8 array, or ``None`` if no obs is cached yet.
+        """
+        if self._last_obs is None or "agentview_image" not in self._last_obs:
+            return None
+        img = self._last_obs["agentview_image"]
+        if not isinstance(img, np.ndarray):
+            img = np.asarray(img)
+        # libero stores images flipped vertically; flipud + ascontiguous
+        # to match what humans expect when watching back.
+        img = np.flipud(img)
+        return np.ascontiguousarray(img.astype(np.uint8))
 
     # ------------------------------------------------------------------
     # internals

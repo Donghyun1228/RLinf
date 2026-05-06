@@ -1,0 +1,42 @@
+env_type: libero_cosmos_correction
+
+# Task -- libero_10 has 10 tasks (0..9). When ``task_ids`` is non-empty
+# the env samples a task at every reset() and rebuilds the underlying
+# LIBERO sim. Single-task training: leave ``task_ids: []`` and set
+# ``task_id`` to the desired index.
+task_suite_name: libero_10
+task_id: 0
+task_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+max_episode_steps: 520
+
+# Cosmos checkpoint and rollout knobs
+cosmos_ckpt_repo: nvidia/Cosmos-Policy-LIBERO-Predict2-2B
+cosmos_chunk_size: 16
+cosmos_num_open_loop_steps: 16
+cosmos_num_denoising_steps_action: 5
+cosmos_seed: 0
+
+# RL-token autoencoder checkpoint (Phase-0 prep)
+rl_token_ae_ckpt_path: ${oc.env:HOME}/donghyun/checkpoints/rl-token-ae/best.pt
+
+# Reward (z_obs_after vs z_goal cos-sim + sparse success bonus)
+dense_coef: 1.0
+success_bonus: 100.0
+
+# Stabilization
+num_steps_wait_after_reset: 10
+
+# Render
+env_resolution: 256
+
+# EnvWorker / RLinf-side fields (single-env for now; multi-env requires
+# sharing the cosmos model across envs in the same process and is deferred).
+total_num_envs: 1
+auto_reset: False
+ignore_terminations: False
+
+video_cfg:
+  save_video: True
+  info_on_video: True
+  extra_info_on_video: ["task_id", "success", "dense_reward"]
+  video_base_dir: ${runner.logger.log_path}/video/train
