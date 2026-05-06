@@ -10,8 +10,12 @@
 
 From the agent's view, a single ``step(correction_action_6d)`` is:
 
-  1. Compose the correction with cosmos's last action's gripper bit
-     (the EE part is sum, gripper passes through) -> 7-DOF env action.
+  1. Compose a 7-DOF env action: the 6-DOF EE part is the correction
+     itself (post-chunk standalone delta-EE, expressed in cosmos's
+     normalized action space and unnormalized via the dataset stats);
+     the gripper bit passes through from cosmos's last action.
+     ``correction = 0`` therefore means "no extra movement, hold the
+     last gripper command" -- the cosmos chunk is trusted as-is.
   2. Run that action for one underlying LIBERO step.
   3. Compute reward
         r = dense_coef * cos_sim(z_obs_after, z_goal)
@@ -223,6 +227,12 @@ class LiberoCosmosCorrectionEnv(gym.Env):
             cfg.cosmos_ckpt_repo, cosmos_cfg
         )
 
+        # Action scale for unnormalizing correction (6-DOF EE only;
+        # cosmos uses min-max normalization to [-1, +1]).
+        a_min = np.asarray(self.dataset_stats["actions_min"], dtype=np.float32)
+        a_max = np.asarray(self.dataset_stats["actions_max"], dtype=np.float32)
+        self._action_scale = (0.5 * (a_max - a_min))[:ACTION_DIM]  # (6,)
+
         # AE: per-env instance is cheap (~290MB), so don't bother sharing.
         self.rl_token_ae = RLTokenAutoencoder()
         if cfg.rl_token_ae_ckpt_path:
@@ -289,10 +299,15 @@ class LiberoCosmosCorrectionEnv(gym.Env):
         if self._goal is None or self._cosmos_action_chunk is None:
             raise RuntimeError("Call reset() before step().")
 
-        # 1. Compose correction with cosmos last action's gripper.
+        # 1. Post-chunk standalone correction: the 6-DOF EE delta is
+        #    the correction itself (in cosmos's normalized action
+        #    space), unnormalized via the cached dataset stats. The
+        #    gripper passes through from cosmos's last action so the
+        #    grasp state is preserved when correction = 0.
         last_cosmos = self._cosmos_action_chunk[0, -1].cpu().numpy()  # (7,)
+        correction_raw = action.astype(np.float32) * self._action_scale  # (6,)
         composed = np.concatenate(
-            [last_cosmos[:6] + action.astype(last_cosmos.dtype), last_cosmos[6:7]],
+            [correction_raw.astype(last_cosmos.dtype), last_cosmos[6:7]],
             axis=-1,
         )
 
