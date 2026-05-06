@@ -260,30 +260,30 @@ class LiberoCosmosCorrectionEnv(gym.Env):
             low=-np.inf, high=np.inf, shape=(ACTION_DIM,), dtype=np.float32
         )
 
-        # Cosmos + dataset_stats (shared across envs in this process)
-        cosmos_cfg = _CosmosCfg(
+        # Cosmos VLA + AE live in a single shared Ray actor so multiple
+        # env workers can hit the same GPU-resident model without each
+        # paying for its own 8GB cosmos load. Keep a local
+        # ``_CosmosCfg`` for the flags we still need on the env side
+        # (``flip_images``, ``model_family``, etc.); the actor builds
+        # its own copy.
+        self.cosmos_cfg = _CosmosCfg(
             chunk_size=cfg.cosmos_chunk_size,
             num_open_loop_steps=cfg.cosmos_num_open_loop_steps,
             num_denoising_steps_action=cfg.cosmos_num_denoising_steps_action,
         )
-        self.cosmos_model, self.dataset_stats, self.cosmos_cfg = _load_shared_cosmos(
-            cfg.cosmos_ckpt_repo, cosmos_cfg
+        from rlinf.envs.libero_cosmos_correction.cosmos_actor import (
+            get_or_create_cosmos_actor,
         )
 
-        # Action scale for unnormalizing correction (6-DOF EE only;
-        # cosmos uses min-max normalization to [-1, +1]).
-        a_min = np.asarray(self.dataset_stats["actions_min"], dtype=np.float32)
-        a_max = np.asarray(self.dataset_stats["actions_max"], dtype=np.float32)
-        self._action_scale = (0.5 * (a_max - a_min))[:ACTION_DIM]  # (6,)
+        self.cosmos_actor = get_or_create_cosmos_actor(cfg)
+        # One-shot RPC at construction so steady-state step() doesn't
+        # round-trip just to read the action scale.
+        import ray as _ray
 
-        # AE: per-env instance is cheap (~290MB), so don't bother sharing.
-        self.rl_token_ae = RLTokenAutoencoder()
-        if cfg.rl_token_ae_ckpt_path:
-            sd = torch.load(cfg.rl_token_ae_ckpt_path, map_location="cpu")
-            self.rl_token_ae.load_state_dict(sd)
-        self.rl_token_ae = self.rl_token_ae.eval().to(DEVICE)
-        for p in self.rl_token_ae.parameters():
-            p.requires_grad_(False)
+        self._action_scale = np.asarray(
+            _ray.get(self.cosmos_actor.get_action_scale.remote()),
+            dtype=np.float32,
+        )
 
         # LIBERO benchmark: keep the suite handle so ``reset()`` can
         # rebuild the sim against a different task on demand.
@@ -315,7 +315,7 @@ class LiberoCosmosCorrectionEnv(gym.Env):
 
         # Per-cycle state (filled in reset / step)
         self._goal: Optional[GoalState] = None
-        self._cosmos_action_chunk: Optional[torch.Tensor] = None  # (1, T, 7)
+        self._cosmos_action_chunk: Optional[np.ndarray] = None  # (1, T, 7) numpy
         self._step_count: int = 0
         self._last_obs: Any = None  # raw libero obs, kept for prepare_observation
 
@@ -406,7 +406,7 @@ class LiberoCosmosCorrectionEnv(gym.Env):
         # 1. Compose the 7-DOF env action: correction in normalized
         #    space, unnormalized via dataset stats; cosmos gripper
         #    passes through.
-        last_cosmos = self._cosmos_action_chunk[0, -1].cpu().numpy()  # (7,)
+        last_cosmos = self._cosmos_action_chunk[0, -1]  # numpy (7,)
         correction_raw = action.astype(np.float32) * self._action_scale  # (6,)
         composed = np.concatenate(
             [correction_raw.astype(last_cosmos.dtype), last_cosmos[6:7]],
@@ -575,30 +575,39 @@ class LiberoCosmosCorrectionEnv(gym.Env):
     # internals
     # ------------------------------------------------------------------
     def _roll_cosmos_cycle(self) -> None:
-        """From ``self._last_obs``: cosmos predict -> execute its chunk in
-        env -> cache new goal + chunk + post-chunk obs."""
+        """From ``self._last_obs``: cosmos predict (RPC) -> execute its
+        chunk in env -> cache new goal + chunk + post-chunk obs."""
+        import ray as _ray
+
         observation = prepare_observation(
             self._last_obs,
             resize_size=self.cfg.env_resolution,
             flip_images=self.cosmos_cfg.flip_images,
         )
+        # The cosmos actor wants numpy on the wire; tensors get pickled
+        # and bounced through CPU anyway, so do it explicitly here.
+        observation_np = {
+            k: (v.detach().cpu().numpy() if torch.is_tensor(v) else v)
+            for k, v in observation.items()
+        }
 
-        action_chunk, goal = get_action_with_goal_state(
-            cfg=self.cosmos_cfg,
-            cosmos_model=self.cosmos_model,
-            rl_token_ae=self.rl_token_ae,
-            dataset_stats=self.dataset_stats,
-            observation=observation,
-            task_description=self._task_description,
-            seed=self.cfg.cosmos_seed,
-            randomize_seed=False,
-            num_denoising_steps_action=self.cosmos_cfg.num_denoising_steps_action,
+        action_chunk_np, goal_z_rl_np = _ray.get(
+            self.cosmos_actor.predict_chunk_and_goal.remote(
+                observation_np,
+                self._task_description,
+                int(self.cfg.cosmos_seed),
+            )
         )
-        self._cosmos_action_chunk = action_chunk  # (1, T, 7), DEVICE
-        self._goal = goal
+        # Keep the chunk as numpy (we feed it to the LIBERO sim as a
+        # python list anyway) and only lift the goal token onto the
+        # GPU when reward time comes.
+        self._cosmos_action_chunk = action_chunk_np  # (1, T, 7) numpy
+        self._goal = GoalState(
+            goal_vae_latent=None,
+            goal_z_rl=torch.from_numpy(goal_z_rl_np).to(DEVICE),
+        )
 
-        # Execute the cosmos chunk open-loop in env.
-        chunk_np = action_chunk[0].cpu().numpy()  # (T, 7)
+        chunk_np = action_chunk_np[0]  # (T, 7) numpy
         n_steps = min(self.cfg.cosmos_num_open_loop_steps, chunk_np.shape[0])
         for t in range(n_steps):
             obs, _, done, _ = self._libero_env.step(chunk_np[t].tolist())
@@ -615,14 +624,26 @@ class LiberoCosmosCorrectionEnv(gym.Env):
                 break
 
     def _encode_obs(self, raw_obs: Any) -> torch.Tensor:
-        """raw libero obs -> ``(1, 768)`` z_obs on DEVICE."""
+        """raw libero obs -> ``(1, 768)`` z_obs on DEVICE.
+
+        Image preprocessing (jpeg roundtrip + resize + center crop) runs
+        locally on the env worker so we ship a small uint8 (1, 3, 224,
+        224) tensor over RPC instead of the full obs dict.
+        """
+        import ray as _ray
+
         observation = prepare_observation(
             raw_obs,
             resize_size=self.cfg.env_resolution,
             flip_images=self.cosmos_cfg.flip_images,
         )
         img_t = _preprocess_image_for_correction(observation["primary_image"])
-        return encode_image_to_rl_token(self.cosmos_model, self.rl_token_ae, img_t)
+        z_obs_np = _ray.get(
+            self.cosmos_actor.encode_image_to_rl_token.remote(
+                img_t.detach().cpu().numpy()
+            )
+        )
+        return torch.from_numpy(z_obs_np).to(DEVICE)
 
     def _batched_state(self) -> dict[str, torch.Tensor]:
         """Encode current obs into the agent-facing state dict with a
